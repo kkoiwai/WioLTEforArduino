@@ -3,7 +3,9 @@
 #include <limits.h>
 #include "WioLTEforArduino.h"
 
-//#define DEBUG
+#define DEBUG
+
+#define AWS_IOT_SSL
 
 #ifdef DEBUG
 #define DEBUG_PRINT(str)			DebugPrint(str)
@@ -32,6 +34,14 @@ static void DebugPrintln(const char* str)
 #define HTTP_POST_CONTENT_TYPE		"application/json"
 
 #define LINEAR_SCALE(val, inMin, inMax, outMin, outMax)	(((val) - (inMin)) / ((inMax) - (inMin)) * ((outMax) - (outMin)) + (outMin))
+
+#ifdef 	AWS_IOT_SSL
+#define AWS_SSLCTXID				(2)  // 0 to 5
+
+#define	AWS_CA_FILEPATH 			"RAM:CA.pem"
+#define	AWS_CERT_FILEPATH 			"RAM:cert.pem"
+#define	AWS_PKEY_FILEPATH 			"RAM:pkey.pem"
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Helper functions
@@ -630,6 +640,9 @@ int WioLTE::SocketOpen(const char* host, int port, SocketType type)
 	if (host == NULL || host[0] == '\0') return RET_ERR(-1);
 	if (port < 0 || 65535 < port) return RET_ERR(-1);
 
+
+	#ifndef AWS_IOT_SSL
+
 	const char* typeStr;
 	switch (type) {
 	case SOCKET_TCP:
@@ -667,6 +680,7 @@ int WioLTE::SocketOpen(const char* host, int port, SocketType type)
 	}
 	if (connectId >= CONNECT_ID_NUM) return RET_ERR(-1);
 
+
 	StringBuilder str;
 	if (!str.WriteFormat("AT+QIOPEN=1,%d,\"%s\",\"%s\",%d", connectId, typeStr, host, port)) return RET_ERR(-1);
 	if (_Module.WriteCommandAndWaitForResponse(str.GetString(), "OK", 150000) == NULL) return RET_ERR(-1);
@@ -675,12 +689,93 @@ int WioLTE::SocketOpen(const char* host, int port, SocketType type)
 	if (_Module.WaitForResponse(str.GetString(), 150000) == NULL) return RET_ERR(-1);
 
 	return RET_OK(connectId);
+
+	#else //AWS_IOT_SSL
+
+
+	bool connectIdUsed[CONNECT_ID_NUM];
+	for (int i = 0; i < CONNECT_ID_NUM; i++) connectIdUsed[i] = false;
+
+	_Module.WriteCommand("AT+QISTATE?");
+	const char* response;
+	ArgumentParser parser;
+	do {
+		if ((response = _Module.WaitForResponse("OK", 10000, "+QISTATE: ", ModuleSerial::WFR_START_WITH)) == NULL) return RET_ERR(-1);
+		if (strncmp(response, "+QISTATE: ", 10) == 0) {
+			parser.Parse(&response[10]);
+			if (parser.Size() >= 1) {
+				int connectId = atoi(parser[0]);
+				if (connectId < 0 || CONNECT_ID_NUM <= connectId) return RET_ERR(-1);
+				connectIdUsed[connectId] = true;
+			}
+		}
+
+	} while (strcmp(response, "OK") != 0);
+
+	int connectId;
+	for (connectId = 0; connectId < CONNECT_ID_NUM; connectId++) {
+		if (!connectIdUsed[connectId]) break;
+	}
+	if (connectId >= CONNECT_ID_NUM) return RET_ERR(-1);
+
+	StringBuilder str;
+	if (!str.WriteFormat("AT+QSSLCFG=\"sslversion\",%d,3", AWS_SSLCTXID)) return RET_ERR(-1);
+	if (_Module.WriteCommandAndWaitForResponse(str.GetString(), "OK", 500) == NULL) return RET_ERR(-1);
+	str.Clear();
+	if (!str.WriteFormat("AT+QSSLCFG=\"ciphersuite\",%d,0XFFFF", AWS_SSLCTXID)) return RET_ERR(-1);
+	if (_Module.WriteCommandAndWaitForResponse(str.GetString(), "OK", 500) == NULL) return RET_ERR(-1);
+	str.Clear();
+	if (!str.WriteFormat("AT+QSSLCFG=\"cacert\",%d,\"%s\"", AWS_SSLCTXID, AWS_CA_FILEPATH)) return RET_ERR(-1);
+	if (_Module.WriteCommandAndWaitForResponse(str.GetString(), "OK", 500) == NULL) return RET_ERR(-1);
+	str.Clear();
+	if (!str.WriteFormat("AT+QSSLCFG=\"clientcert\",%d,\"%s\"", AWS_SSLCTXID, AWS_CERT_FILEPATH)) return RET_ERR(-1);
+	if (_Module.WriteCommandAndWaitForResponse(str.GetString(), "OK", 500) == NULL) return RET_ERR(-1);
+	str.Clear();
+	if (!str.WriteFormat("AT+QSSLCFG=\"clientkey\",%d,\"%s\"", AWS_SSLCTXID, AWS_PKEY_FILEPATH)) return RET_ERR(-1);
+	if (_Module.WriteCommandAndWaitForResponse(str.GetString(), "OK", 500) == NULL) return RET_ERR(-1);
+	str.Clear();
+	if (!str.WriteFormat("AT+QSSLCFG=\"seclevel\",%d,2", AWS_SSLCTXID)) return RET_ERR(-1);
+	if (_Module.WriteCommandAndWaitForResponse(str.GetString(), "OK", 500) == NULL) return RET_ERR(-1);
+	str.Clear();
+	if (!str.WriteFormat("AT+QSSLOPEN=1,%d,%d,\"%s\",%d", AWS_SSLCTXID, connectId, host, port)) return RET_ERR(-1);
+
+	// if (_Module.WriteCommandAndWaitForResponse(str.GetString(), "ERROR", 150000) == NULL) return RET_ERR(-1);
+	// _Module.WriteCommand("AT+QIGETERROR");
+	// delay(3000);
+	// _Module.WriteCommand("AT+QSSLSTATE");
+	// delay(3000);
+	// _Module.WriteCommand("AT+QSSLOPEN=?");
+	// delay(3000);
+	// _Module.WriteCommand("AT+QIDNSCFG=1");
+	// delay(3000);
+	// _Module.WriteCommand("AT+QSSLSTATE=0");
+	// delay(3000);
+	// // _Module.WriteCommand("AT+QSSLCFG=\"ignorelocaltime\",2");
+	// // delay(3000);
+	// // _Module.WriteCommand("AT+QSSLCFG=\"negotiatetime\",2");
+	// // delay(3000);
+	// // _Module.WriteCommand("AT+QIDNSGIP=1,\"a2yt56pnugbbig.iot.ap-northeast-1.amazonaws.com\"");
+	// // delay(3000);
+	
+	// return connectId;
+
+	if (_Module.WriteCommandAndWaitForResponse(str.GetString(), "OK", 150000) == NULL) return RET_ERR(-1);
+	str.Clear();
+	if (!str.WriteFormat("+QSSLOPEN: %d,0", connectId)) return RET_ERR(-1);
+	if (_Module.WaitForResponse(str.GetString(), 150000) == NULL) return RET_ERR(-1);
+
+	return RET_OK(connectId);
+
+	#endif //AWS_IOT_SSL
+
 }
 
 bool WioLTE::SocketSend(int connectId, const byte* data, int dataSize)
 {
 	if (connectId >= CONNECT_ID_NUM) return RET_ERR(false);
 	if (dataSize > 1460) return RET_ERR(false);
+
+	#ifndef AWS_IOT_SSL
 
 	StringBuilder str;
 	if (!str.WriteFormat("AT+QISEND=%d,%d", connectId, dataSize)) return RET_ERR(false);
@@ -690,6 +785,19 @@ bool WioLTE::SocketSend(int connectId, const byte* data, int dataSize)
 	if (_Module.WaitForResponse("SEND OK", 5000) == NULL) return RET_ERR(false);
 
 	return RET_OK(true);
+
+	#else //AWS_IOT_SSL
+
+	StringBuilder str;
+	if (!str.WriteFormat("AT+QSSLSEND=%d,%d", connectId, dataSize)) return RET_ERR(false);
+	_Module.WriteCommand(str.GetString());
+	if (_Module.WaitForResponse(NULL, 500, "> ", ModuleSerial::WFR_WITHOUT_DELIM) == NULL) return RET_ERR(false);
+	_Module.Write(data, dataSize);
+	if (_Module.WaitForResponse("SEND OK", 5000) == NULL) return RET_ERR(false);
+
+	return RET_OK(true);
+
+	#endif //AWS_IOT_SSL
 }
 
 bool WioLTE::SocketSend(int connectId, const char* data)
@@ -700,6 +808,8 @@ bool WioLTE::SocketSend(int connectId, const char* data)
 int WioLTE::SocketReceive(int connectId, byte* data, int dataSize)
 {
 	if (connectId >= CONNECT_ID_NUM) return RET_ERR(-1);
+
+	#ifndef AWS_IOT_SSL
 
 	StringBuilder str;
 	if (!str.WriteFormat("AT+QIRD=%d", connectId)) return RET_ERR(-1);
@@ -714,6 +824,24 @@ int WioLTE::SocketReceive(int connectId, byte* data, int dataSize)
 	if (_Module.WaitForResponse("OK", 500) == NULL) return RET_ERR(-1);
 
 	return RET_OK(dataLength);
+
+	#else //AWS_IOT_SSL
+
+	StringBuilder str;
+	if (!str.WriteFormat("AT+QSSLRECV=%d,%d", connectId,dataSize)) return RET_ERR(-1);
+	_Module.WriteCommand(str.GetString());
+	const char* parameter;
+	if ((parameter = _Module.WaitForResponse(NULL, 500, "+QSSLRECV: ", ModuleSerial::WFR_START_WITH)) == NULL) return RET_ERR(-1);
+	int dataLength = atoi(&parameter[11]);
+	if (dataLength >= 1) {
+		if (dataLength > dataSize) return RET_ERR(-1);
+		if (_Module.Read(data, dataLength, 500) != dataLength) return RET_ERR(-1);
+	}
+	if (_Module.WaitForResponse("OK", 500) == NULL) return RET_ERR(-1);
+
+	return RET_OK(dataLength);
+
+	#endif //AWS_IOT_SSL
 }
 
 int WioLTE::SocketReceive(int connectId, char* data, int dataSize)
@@ -752,10 +880,20 @@ bool WioLTE::SocketClose(int connectId)
 {
 	if (connectId >= CONNECT_ID_NUM) return RET_ERR(false);
 
+
+	#ifndef AWS_IOT_SSL
+
 	StringBuilder str;
 	if (!str.WriteFormat("AT+QICLOSE=%d", connectId)) return RET_ERR(false);
 	if (_Module.WriteCommandAndWaitForResponse(str.GetString(), "OK", 10000) == NULL) return RET_ERR(false);
 
+	#else //AWS_IOT_SSL
+
+	StringBuilder str;
+	if (!str.WriteFormat("AT+QSSLCLOSE=%d", connectId)) return RET_ERR(false);
+	if (_Module.WriteCommandAndWaitForResponse(str.GetString(), "OK", 10000) == NULL) return RET_ERR(false);
+
+	#endif //AWS_IOT_SSL
 	return RET_OK(true);
 }
 
@@ -877,3 +1015,35 @@ bool WioLTE::HttpPost(const char* url, const char* data, int* responseCode)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
+
+
+bool WioLTE::SetupCA(const char* pem_CA, const char* pem_cert, const char* pem_pkey)
+{
+	StringBuilder str;
+
+
+	if (!str.WriteFormat("AT+QFUPL=\"%s\",%d", AWS_CA_FILEPATH, strlen(pem_CA))) return false;
+	_Module.WriteCommand(str.GetString());
+	if (_Module.WaitForResponse("CONNECT", 5000) == NULL) return false;
+	_Module.Write(pem_CA);
+	if (_Module.WaitForResponse(NULL, 5000, "+QFUPL:", (ModuleSerial::WaitForResponseFlag)(ModuleSerial::WFR_START_WITH | ModuleSerial::WFR_REMOVE_START_WITH)) == NULL) return RET_ERR(-1);
+	if (_Module.WaitForResponse("OK", 5000, NULL, (ModuleSerial::WaitForResponseFlag) ModuleSerial::WFR_GET_NULL_STRING) == NULL) return false;
+
+	str.Clear();
+	if (!str.WriteFormat("AT+QFUPL=\"%s\",%d", AWS_CERT_FILEPATH, strlen(pem_cert))) return false;
+	_Module.WriteCommand(str.GetString());
+	if (_Module.WaitForResponse("CONNECT", 5000) == NULL) return false;
+	_Module.Write(pem_cert);
+	if (_Module.WaitForResponse(NULL, 5000, "+QFUPL:", (ModuleSerial::WaitForResponseFlag)(ModuleSerial::WFR_START_WITH | ModuleSerial::WFR_REMOVE_START_WITH)) == NULL) return RET_ERR(-1);
+	if (_Module.WaitForResponse("OK", 5000, NULL, (ModuleSerial::WaitForResponseFlag) ModuleSerial::WFR_GET_NULL_STRING) == NULL) return false;
+
+	str.Clear();
+	if (!str.WriteFormat("AT+QFUPL=\"%s\",%d", AWS_PKEY_FILEPATH, strlen(pem_pkey))) return false;
+	_Module.WriteCommand(str.GetString());
+	if (_Module.WaitForResponse("CONNECT", 5000) == NULL) return false;
+	_Module.Write(pem_pkey);
+	if (_Module.WaitForResponse(NULL, 5000, "+QFUPL:", (ModuleSerial::WaitForResponseFlag)(ModuleSerial::WFR_START_WITH | ModuleSerial::WFR_REMOVE_START_WITH)) == NULL) return RET_ERR(-1);
+	if (_Module.WaitForResponse("OK", 5000, NULL, (ModuleSerial::WaitForResponseFlag) ModuleSerial::WFR_GET_NULL_STRING) == NULL) return false;
+
+	return true;
+}
